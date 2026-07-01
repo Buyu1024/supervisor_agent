@@ -15,7 +15,7 @@
 | 模块 | 状态 | 职责 |
 |------|:---:|------|
 | **感知模块** | ✅ 已完成 | 多源输入 → 格式识别 → 预处理 → 标准化输出 |
-| LLM 模块 | 🔲 待开发 | 大语言模型调用与管理 |
+| **LLM 模块** | ✅ 已完成 | LLM 调用 + Function Calling 闭环管理 |
 | 记忆模块 | 🔲 待开发 | 对话历史、长期记忆、向量检索 |
 | 规划模块 | 🔲 待开发 | 任务分解、推理路径规划 |
 | 工具模块 | 🔲 待开发 | 工具注册、调用、结果解析 |
@@ -81,6 +81,94 @@ class Message:
 
 ---
 
+## 🤖 LLM 模块
+
+### 核心能力
+
+LLM 模块封装了 qwen3.7-plus 模型调用，支持纯对话和 Function Calling 工具调用两种模式。**工具调用闭环完全在模块内部管理**，对外只暴露"输入消息 → 最终回复"。
+
+```
+┌─────────────────────────────────────────────────────┐
+│                 LLM 模块架构                          │
+│                                                      │
+│  messages ──→ PromptBuilder ──→ QwenClient           │
+│  tools ────→                    (DashScope API)      │
+│  context ──→                          │              │
+│                                       ▼              │
+│                               ToolLoopManager        │
+│                               finish_reason?         │
+│                               ├── "stop" → 返回文本  │
+│                               └── "tool_calls"       │
+│                                    → 执行工具        │
+│                                    → 回填结果        │
+│                                    → 循环            │
+│                                       │              │
+│                                       ▼              │
+│                                  LLMResponse         │
+└─────────────────────────────────────────────────────┘
+```
+
+### 组件
+
+| 组件 | 文件 | 职责 |
+|------|------|------|
+| `QwenClient` | `client.py` | DashScope OpenAI 兼容接口封装 + 指数退避重试 |
+| `PromptBuilder` | `prompt_builder.py` | 内部 Message/dict → OpenAI messages 格式转换，上下文注入 |
+| `ToolLoopManager` | `tool_loop.py` | Function Calling 闭环：轮询 finish_reason、执行工具、回填结果 |
+| `LLMModule` | `module.py` | 主入口，组装上述组件 + 多轮对话历史管理 |
+
+### LLMResponse 结构
+
+```python
+@dataclass
+class LLMResponse:
+    content: str                # 最终回复文本
+    finish_reason: str          # "stop" / "tool_calls" / "error" / "max_rounds"
+    token_usage: dict           # {prompt_tokens, completion_tokens, total_tokens}
+    tool_calls_log: list[dict]  # 工具调用记录 [{round, name, arguments, result}]
+```
+
+### 使用示例
+
+```python
+from agent_demo.llm import LLMModule
+from agent_demo.perception import PerceptionModule, Message
+
+# 纯对话模式
+llm = LLMModule(
+    api_key="sk-xxx",                       # None → 读环境变量 DASHSCOPE_API_KEY
+    system_prompt="用中文简短回答",
+)
+
+# 单轮对话
+msg = Message(content="你好，请介绍一下自己", role="user")
+response = llm.chat(messages=[msg])
+print(response.content)
+
+# 多轮对话（历史自动管理）
+llm.chat(messages=[Message(content="我叫张三", role="user")])
+response = llm.chat(messages=[Message(content="我叫什么名字？", role="user")])
+print(response.content)  # "你叫张三。"
+llm.clear_history()
+
+# 感知模块 → LLM 模块串联
+pm = PerceptionModule()
+msg = pm.process("path/to/file.txt")
+response = llm.chat(messages=[msg])
+
+# 带工具的调用（注入 ToolsModule executor）
+# tools_mod = ToolsModule()
+# llm = LLMModule(tool_executor=tools_mod.get_executor())
+# response = llm.chat(messages=[msg], tools=tools_mod.get_schemas())
+```
+
+**关键设计**：
+- **内部闭环**：工具调用循环在 ToolLoopManager 中自动管理，调用方只需传入工具 schema
+- **历史管理**：`_history` 自动累积多轮对话，支持 context 动态更新
+- **回调注入**：`tool_executor` 通过构造函数注入，LLM 模块不持有 ToolsModule
+
+---
+
 ## 🚀 快速开始
 
 ### 环境要求
@@ -131,8 +219,11 @@ if msg.is_rejected:
 ### 运行测试
 
 ```bash
+# 感知模块测试（23 个用例）
 uv run python tests/test_perception.py
-# 23 个用例，全部通过
+
+# LLM 模块测试（15 个用例，需要 DASHSCOPE_API_KEY 环境变量）
+uv run python tests/test_llm.py
 ```
 
 ---
@@ -174,8 +265,17 @@ AgentDemoProject/
 │       ├── truncation.py                   # 长度截断过滤器
 │       └── language.py                     # 语言检测过滤器
 │
+├── src/agent_demo/llm/                     # LLM 模块
+│   ├── __init__.py                         # 公开 API
+│   ├── types.py                            # LLMResponse 数据结构
+│   ├── client.py                           # QwenClient（DashScope 封装 + 重试）
+│   ├── prompt_builder.py                   # Message → OpenAI messages 格式转换
+│   ├── tool_loop.py                        # Function Calling 闭环管理
+│   └── module.py                           # LLMModule 主入口
+│
 └── tests/                                  # 测试
-    ├── test_perception.py                  # 23 个测试用例
+    ├── test_perception.py                  # 感知模块（23 个测试用例）
+    ├── test_llm.py                         # LLM 模块（15 个测试用例）
     └── samples/                            # 测试样本文件
         ├── ocr_01.pptx
         ├── ocr_02.docx
@@ -188,13 +288,14 @@ AgentDemoProject/
 
 ## 📦 依赖
 
-| 包 | 用途 | 体积 |
-|---|------|------|
-| `rapidocr-onnxruntime` | 图片 / 嵌入图片 OCR | 轻量（ONNX Runtime） |
-| `python-docx` | Word 文档解析 | — |
-| `python-pptx` | PPT 解析（形状/表格/图表） | — |
-| `pymupdf` | PDF 解析 + 表格检测 + 页面渲染 | — |
-| `langdetect` | 语言检测 | — |
+| 包 | 用途 | 所属模块 |
+|---|------|:---:|
+| `rapidocr-onnxruntime` | 图片 / 嵌入图片 OCR | 感知 |
+| `python-docx` | Word 文档解析 | 感知 |
+| `python-pptx` | PPT 解析（形状/表格/图表） | 感知 |
+| `pymupdf` | PDF 解析 + 表格检测 + 页面渲染 | 感知 |
+| `langdetect` | 语言检测 | 感知 |
+| `openai` | LLM API 调用（OpenAI 兼容协议） | LLM |
 
 > 设计原则：**不引入 PaddlePaddle**（体积大、Windows 兼容性差），OCR 使用基于 ONNX Runtime 的 RapidOCR。
 
@@ -218,7 +319,7 @@ MIT License
 
 ## 🔮 后续计划
 
-- [ ] LLM 模块：对接 Claude / OpenAI / 本地模型
+- [x] LLM 模块：qwen3.7-plus + Function Calling 闭环
+- [ ] 工具模块：工具注册、Schema 管理、执行器
 - [ ] 记忆模块：对话历史 + 向量检索 + 长期记忆
 - [ ] 规划模块：任务分解与推理规划
-- [ ] 工具模块：工具注册、调用、结果解析
