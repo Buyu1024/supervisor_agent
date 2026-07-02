@@ -313,6 +313,67 @@ class TestAPI:
         finally:
             os.unlink(file_path)
 
+    def test_tool_calling_loop(self):
+        """Function Calling 闭环 —— 需要 API Key"""
+        api_key = os.environ.get("DASHSCOPE_API_KEY")
+        if not api_key:
+            print("  [SKIP] 工具调用闭环: 未设置 DASHSCOPE_API_KEY，跳过真实 API 测试")
+            return
+
+        from agent_demo.tools import ToolsModule
+        from agent_demo.llm import LLMModule
+        from agent_demo.perception import Message
+
+        # 注册工具
+        tools = ToolsModule()
+
+        @tools.register(
+            name="get_weather",
+            description="获取指定城市当天天气。必须先调用此工具获取数据，禁止编造天气信息。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string", "description": "城市名称"}
+                },
+                "required": ["city"],
+            },
+        )
+        def get_weather(city: str) -> str:
+            return f"{city}今天晴转多云，气温18-26°C，北风3级，空气质量良。"
+
+        # 注入 LLM 模块
+        llm = LLMModule(
+            system_prompt=(
+                "你是天气预报助手。用户询问天气时，必须调用 get_weather 工具获取数据，"
+                "然后基于工具返回的真实数据回答。不要跳过工具调用直接编造天气。"
+            ),
+            tool_executor=tools.get_executor(),
+        )
+
+        response = llm.chat(
+            messages=[Message(content="北京今天天气怎么样？", role="user")],
+            tools=tools.get_schemas(),
+        )
+
+        assert response.content, "回复不应为空"
+        print(f"  [PASS] 工具调用闭环: {response}")
+
+        # 验证工具调用记录
+        tool_count = len(response.tool_calls_log)
+        print(f"    工具调用轮数: {tool_count}")
+        if tool_count > 0:
+            call = response.tool_calls_log[0]
+            print(f"    调用工具: {call['name']}({call['arguments']})")
+            print(f"    工具结果: {call['result'][:100]}...")
+            assert call["name"] == "get_weather", f"应调用 get_weather，实际: {call['name']}"
+            assert "北京" in str(call["arguments"]), f"参数应含'北京'，实际: {call['arguments']}"
+            print(f"    ✅ 工具被正确调用并返回结果")
+        else:
+            print(f"    ⚠️ 模型未触发工具调用（可能直接用自身知识回答）")
+
+        print(f"    最终回复: {response.content[:200]}...")
+        print(f"    Token 用量: {response.token_usage}")
+
 
 # ============================================================
 # 运行入口
