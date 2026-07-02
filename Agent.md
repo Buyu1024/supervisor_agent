@@ -272,73 +272,94 @@ memory.remember([
 
 ---
 
-### 2.4 规划模块 (Planning) —— 🔲 待开发
+### 2.4 规划模块 (Planning) —— ✅ 已完成
 
 | 维度 | 说明 |
 |------|------|
-| **职责** | 将用户意图分解为可执行的步骤序列，管理任务依赖和分支逻辑 |
-| **输入** | 用户 Message + 记忆模块上下文 + 可用工具列表 |
-| **输出** | `TaskPlan`（步骤列表，每步包含 action/args/depends_on） |
+| **职责** | 将用户意图分解为可执行的步骤序列，管理执行状态和依赖关系，支持失败重规划 |
+| **输入** | 用户意图（字符串）、记忆上下文、可用工具列表 |
+| **输出** | TaskPlan（步骤列表 + 执行历史 + 进度摘要） |
 
-**规划模式（按复杂度递进）**：
+**设计理念（借鉴主流 Agent）**：
 
 ```
-规划模块
-├── ReAct 模式          # Thought → Action → Observation 循环（开箱即用）
-├── Plan-and-Execute    # 先出完整计划 → 逐步执行（适合复杂任务）
-├── 动态重规划          # 执行中遇错/新信息 → 调整后续步骤
-└── 子任务委派          # 将子任务委派给子 Agent
+借鉴来源                          实现方式
+─────────────────────────────────────────────────────────
+Claude Code "TodoWrite"         计划质量取决于 prompt 工程
+Codex "ExecPlan"                 计划是自包含活文档（可序列化/恢复）
+Anthropic "一次只做一件事"        每步单一职责，完成后明确记录
 ```
 
-**对外接口（草案）**：
+**核心架构**（纯状态机，不持有 LLM/Tools）：
+
+```
+PlanningModule
+├── PlanPromptBuilder（Prompt 构建器 —— 计划质量的核心）
+│   ├── build_plan_prompt()   → 生成初始计划
+│   ├── build_step_prompt()    → 执行单个步骤（自包含上下文）
+│   └── build_revise_prompt()  → 重规划后续步骤
+│
+├── PlanExecutor（执行状态机）
+│   ├── 生命周期: start → get_next → record_result → finalize
+│   ├── 依赖解析: 拓扑顺序 + 并行检测
+│   ├── 重试机制: 单步失败自动重试
+│   ├── 重规划: 失败影响后续步骤时触发
+│   └── 循环依赖检测: DFS 检测
+│
+└── 数据结构
+    ├── TaskStep（id, description, instruction, action, depends_on, status）
+    ├── StepResult（step_id, success, output, error, elapsed_ms）
+    └── TaskPlan（goal, steps, status, results, 序列化/反序列化）
+```
+
+**对外接口**：
 
 ```python
 class PlanningModule:
-    def create_plan(
-        self,
-        intent: str,
-        context: str,
-        available_tools: list[ToolDef],
-        history: list[Message],
-    ) -> TaskPlan: ...
+    def __init__(self, max_retries_per_step=2, max_revisions=3, skip_failed_non_critical=True): ...
 
-    def revise_plan(
-        self,
-        current_plan: TaskPlan,
-        observation: str,          # 上一步执行结果
-        step_index: int,           # 当前步骤索引
-    ) -> TaskPlan: ...             # 返回调整后的计划
+    # Prompt 构建（给 Orchestrator 用）
+    def build_plan_prompt(intent, context, tool_schemas) -> str: ...
+    def build_step_prompt(plan, step) -> str: ...
+    def build_revise_prompt(plan, failed_step_id, error) -> str: ...
+
+    # 计划解析（从 LLM JSON 输出中提取）
+    def parse_plan(llm_output) -> TaskPlan: ...
+    def parse_steps(llm_output) -> list[TaskStep]: ...
+
+    # 状态管理（给 Orchestrator 驱动执行循环）
+    def start_plan(plan) -> TaskPlan: ...
+    def get_next_step(plan) -> TaskStep | None: ...
+    def record_result(plan, result) -> TaskPlan: ...
+    def should_revise(plan) -> bool: ...
+    def revise_plan(plan, revised_steps) -> TaskPlan: ...
+    def is_complete(plan) -> bool: ...
+    def finalize_plan(plan) -> TaskPlan: ...
+
+    # 进度
+    def get_progress(plan) -> dict: ...
+    def get_results_summary(plan) -> str: ...
 ```
 
-**TaskPlan 数据结构**：
+**Orchestrator 驱动模式**（未来 AgentOrchestrator 的使用方式）：
 
 ```python
-@dataclass
-class TaskStep:
-    id: str                  # 步骤唯一 ID
-    description: str         # 步骤描述（给用户看的）
-    action: str              # 动作类型: "think" / "tool_call" / "respond"
-    tool_name: str | None    # 要调用的工具名
-    tool_args: dict | None   # 工具参数
-    depends_on: list[str]    # 依赖的前置步骤 ID
+planning = PlanningModule()
+plan = planning.parse_plan(llm.chat(planning.build_plan_prompt(intent, ...)))
+plan = planning.start_plan(plan)
 
-@dataclass
-class TaskPlan:
-    goal: str                # 任务目标
-    steps: list[TaskStep]    # 步骤列表
-    status: str              # "pending" / "running" / "completed" / "failed"
+while (step := planning.get_next_step(plan)):
+    prompt = planning.build_step_prompt(plan, step)
+    result = llm.chat(messages=[Message(content=prompt)], tools=...)
+    plan = planning.record_result(plan, StepResult(
+        step_id=step.id, success=True, output=result.content,
+    ))
+    if planning.should_revise(plan):
+        revised = llm.chat(planning.build_revise_prompt(plan, ...))
+        plan = planning.revise_plan(plan, planning.parse_steps(revised))
+
+summary = planning.finalize_plan(plan)
 ```
-
-**关键设计决策（用户决定）**：
-
-1. **默认规划模式？**
-   - [ ] ReAct（简单、稳定、适合大多数场景）
-   - [ ] Plan-and-Execute（更结构化，适合多步任务）
-   - [ ] 自适应（简单任务 ReAct，复杂任务 Plan-and-Execute）
-
-2. **规划由谁执行？**
-   - [ ] 由 LLM 模块生成计划（Planning 模块只是数据结构 + 状态管理）
-   - [ ] Planning 模块内有独立推理逻辑（规则 + 模板）
 
 ---
 
@@ -486,12 +507,12 @@ Orchestrator
 ## 4. 实现路线图
 
 ```
-Phase 1: 感知模块 ✅ 已完成
-Phase 2: LLM 模块    ← 当前阶段
-Phase 3: 工具模块     (与 LLM 紧密配合，建议紧随其后)
-Phase 4: 记忆模块     (LLM + 工具稳定后再接入长期记忆)
-Phase 5: 规划模块     (复杂任务编排，放最后以利用各模块的成熟能力)
-Phase 6: 编排器 + 端到端集成测试
+Phase 1: 感知模块 ✅ 已完成（8827e7a）
+Phase 2: LLM 模块   ✅ 已完成（9710cee）
+Phase 3: 工具模块   ✅ 已完成（8cd805a）
+Phase 4: 记忆模块   ✅ 已完成（d5bea22）
+Phase 5: 规划模块   ✅ 已完成（待提交）
+Phase 6: 编排器 + 端到端集成测试 ← 下一步
 ```
 
 **建议顺序的理由**：LLM 和工具是 Agent 的核心循环（思考 ↔ 行动），应先打通；记忆为 LLM 提供上下文增强；规划在最上层编排复杂流程。
@@ -519,7 +540,8 @@ Phase 6: 编排器 + 端到端集成测试
 | 5 | Embedding 模型选型 | Memory | ✅ | **抽象接口 + 双实现**（DashScope API + 本地 BGE） |
 | 6 | 长期记忆范围 | Memory | ✅ | **全部**（对话摘要 + 用户偏好 + 实体关系 + 知识片段） |
 | 7 | 会话存储实现 | Memory | ✅ | **内存 dict**（接口化，后续可换 Redis） |
-| 8 | 默认规划模式 | Planning | 🟡 | 待定：ReAct / Plan-and-Execute |
-| 9 | 工具安全确认策略 | Tools | ✅ | **回调注入**（require_confirm + confirm_callback） |
-| 10 | 首批内置工具 | Tools | ✅ | **仅框架**，工具由用户自由注册 |
-| 11 | LLM API Key 配置方式 | LLM | ✅ | **环境变量 + 显式传入**（两种方式） |
+| 8 | 默认规划模式 | Planning | ✅ | **Plan-and-Execute**（先生成完整计划再逐步执行） |
+| 9 | 计划执行方式 | Planning | ✅ | **纯状态机**（不持有 LLM/Tools，由 Orchestrator 驱动） |
+| 10 | 工具安全确认策略 | Tools | ✅ | **回调注入**（require_confirm + confirm_callback） |
+| 11 | 首批内置工具 | Tools | ✅ | **仅框架**，工具由用户自由注册 |
+| 12 | LLM API Key 配置方式 | LLM | ✅ | **环境变量 + 显式传入**（两种方式） |
