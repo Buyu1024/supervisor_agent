@@ -1,8 +1,14 @@
 """LLM 模块 —— 集成测试 Demo"""
 
 import os
+import sys
 import tempfile
 from pathlib import Path
+
+# 确保 src 目录在 Python 路径中（支持直接 python tests/test_llm.py 运行）
+_SRC_DIR = Path(__file__).parent.parent / "src"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
 
 # 自动加载 .env 文件（如果存在）
 _ENV_PATH = Path(__file__).parent.parent / ".env"

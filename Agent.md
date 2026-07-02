@@ -191,57 +191,84 @@ def _run_tool_loop(self, messages: list[dict], tool_schemas: list[dict]) -> LLMR
 
 ---
 
-### 2.3 记忆模块 (Memory) —— 🔲 待开发
+### 2.3 记忆模块 (Memory) —— ✅ 已完成
 
 | 维度 | 说明 |
 |------|------|
 | **职责** | 管理对话历史、长期知识、当前任务上下文，为 LLM 提供精准的检索增强 |
-| **输入** | 对话轮次（Message 列表）、用户偏好、外部知识 |
-| **输出** | 检索到的相关上下文（Context 字符串 / 结构化数据） |
+| **输入** | 对话轮次（dict 列表）、用户偏好、实体信息 |
+| **输出** | 检索到的相关上下文（Context 字符串，可直接注入 LLMModule.chat()） |
 
 **三层记忆架构**：
 
 ```
-记忆模块
-├── 短期记忆 (Working Memory)
-│   └── 当前会话的最近 N 轮对话，滑动窗口
+MemoryModule
+├── MemoryManager（策略层 —— 协调三层记忆的读写压缩遗忘）
+│   ├── WorkingMemory（短期记忆 / 滑动窗口）
+│   │   ├── deque 消息队列 + tiktoken 精确计数
+│   │   ├── Token 预算控制 → 超预算自动截断旧消息
+│   │   └── 摘要压缩：旧消息 → LLM 摘要 → 存入长期记忆
+│   │
+│   ├── LongTermMemory（长期记忆）
+│   │   ├── FAISSVectorStore（FAISS IndexFlatIP + L2 归一化）
+│   │   │   └── 持久化：faiss.write_index + pickle metadata
+│   │   ├── RelStore（SQLite，零外部依赖）
+│   │   │   ├── 用户偏好表（key-value）
+│   │   │   ├── 实体表（name-type-properties）
+│   │   │   └── 关系表（source-relation-target 三元组）
+│   │   └── Embedder 抽象层
+│   │       ├── DashScopeEmbedder（text-embedding-v3, dim=1024）
+│   │       └── LocalEmbedder（sentence-transformers, 可选依赖）
+│   │
+│   └── SessionStore（会话 KV 存储）
+│       ├── 内存 dict 实现 + TTL 过期机制
+│       └── export_summary() → 注入 LLM 上下文
 │
-├── 长期记忆 (Long-term Memory)
-│   ├── 向量存储 (Milvus / Faiss)：语义检索历史对话 & 知识
-│   ├── 结构化存储 (MySQL)：用户偏好、实体关系
-│   └── Embedding 服务：文本转向量
-│
-└── 记忆管理
-    ├── 记忆写入策略：何时存、存什么
-    ├── 记忆检索策略：语义搜索 + 关键词 + 时间衰减
-    └── 记忆遗忘策略：容量上限、重要性评分
+├── 记忆写入策略：自动提取偏好/实体（规则匹配 + 后续可接入 LLM）
+├── 记忆检索策略：语义搜索（FAISS）+ 关键词（SQLite）+ 类型过滤
+└── 记忆遗忘策略：时间衰减 + 重要性阈值 + 容量上限
 ```
 
-**对外接口（草案）**：
+**对外接口**：
 
 ```python
 class MemoryModule:
-    def retrieve(self, query: str, top_k: int = 5) -> list[MemoryItem]: ...
-    def remember(self, message: Message, importance: float = 0.5) -> None: ...
-    def get_conversation_history(self, n: int = 10) -> list[Message]: ...
-    def summarize_and_compress(self) -> str: ...  # 压缩旧对话为摘要
+    def __init__(
+        self,
+        embedder: Embedder | None = None,
+        embedder_provider: str = "dashscope",
+        persist_dir: str | None = None,
+        max_working_tokens: int = 8000,
+        system_prompt: str | None = None,
+        api_key: str | None = None,
+    ): ...
+
+    def retrieve(self, query: str, top_k: int = 5) -> str: ...
+    def remember(self, messages: list[dict]) -> None: ...
+    def remember_item(self, content: str, memory_type: str, importance: float) -> str: ...
+    def compress(self) -> str | None: ...
+    def add_preference(self, key: str, value: str) -> None: ...
+    def get_preference(self, key: str) -> str | None: ...
+    def set_session(self, key: str, value, ttl: float = None) -> None: ...
+    def get_session(self, key: str, default=None) -> Any: ...
+    def run_forgetting(self) -> dict: ...
+    def save(self) -> None: ...
+    def clear_session(self) -> None: ...
 ```
 
-**关键设计决策（用户决定）**：
+**与 LLM 模块集成**：
 
-1. **向量数据库选型？**
-   - [ ] Milvus（Docker 部署，已有环境）
-   - [ ] Faiss（轻量，本地文件）
-   - [ ] ChromaDB（一站式，Python 原生）
+```python
+# MemoryModule.retrieve() 的返回值直接传给 LLMModule
+context = memory.retrieve("用户最近在聊什么？")
+response = llm.chat(messages=[...], context=context)
 
-2. **Embedding 模型？**
-   - [ ] 本地模型（BGE / text2vec）
-   - [ ] API 服务（OpenAI / 硅基流动）
-
-3. **长期记忆的范围？**
-   - [ ] 仅存历史对话摘要
-   - [ ] 存用户偏好 + 实体 + 知识片段
-   - [ ] 全部
+# 对话结束后保存
+memory.remember([
+    {"role": "user", "content": "..."},
+    {"role": "assistant", "content": "..."},
+])
+```
 
 ---
 
@@ -488,9 +515,11 @@ Phase 6: 编排器 + 端到端集成测试
 | 1 | LLM Provider | LLM | ✅ | **qwen3.7-plus**（DashScope，OpenAI 兼容协议） |
 | 2 | 工具调用协议 | LLM + Tools | ✅ | **OpenAI Function Calling 格式** |
 | 3 | Func Call 循环管理 | LLM | ✅ | **LLM 模块内部闭环**（对外透明） |
-| 4 | 向量数据库选型 | Memory | 🔴 | 待定：Milvus / Faiss / ChromaDB |
-| 5 | Embedding 模型选型 | Memory | 🔴 | 待定：本地 BGE / API 服务 |
-| 6 | 默认规划模式 | Planning | 🟡 | 待定：ReAct / Plan-and-Execute |
-| 7 | 工具安全确认策略 | Tools | 🟡 | 待定 |
-| 8 | 首批内置工具 | Tools | 🟡 | 待定 |
-| 9 | LLM API Key 配置方式 | LLM | 🔴 | 待定：环境变量 / 配置文件 / 代码传入 |
+| 4 | 向量数据库选型 | Memory | ✅ | **FAISS**（IndexFlatIP，轻量本地索引） |
+| 5 | Embedding 模型选型 | Memory | ✅ | **抽象接口 + 双实现**（DashScope API + 本地 BGE） |
+| 6 | 长期记忆范围 | Memory | ✅ | **全部**（对话摘要 + 用户偏好 + 实体关系 + 知识片段） |
+| 7 | 会话存储实现 | Memory | ✅ | **内存 dict**（接口化，后续可换 Redis） |
+| 8 | 默认规划模式 | Planning | 🟡 | 待定：ReAct / Plan-and-Execute |
+| 9 | 工具安全确认策略 | Tools | ✅ | **回调注入**（require_confirm + confirm_callback） |
+| 10 | 首批内置工具 | Tools | ✅ | **仅框架**，工具由用户自由注册 |
+| 11 | LLM API Key 配置方式 | LLM | ✅ | **环境变量 + 显式传入**（两种方式） |

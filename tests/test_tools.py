@@ -1,6 +1,13 @@
 """工具模块 —— 集成测试 Demo"""
 
+import sys
 import time
+from pathlib import Path
+
+# 确保 src 目录在 Python 路径中（支持直接 python tests/test_tools.py 运行）
+_SRC_DIR = Path(__file__).parent.parent / "src"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
 
 
 # ============================================================
