@@ -166,9 +166,10 @@ class PlanExecutor:
             step.status = "completed"
         else:
             retries = self._retry_count.get(step.id, 0)
+            # 始终递增计数器（确保 get_next_step 能正确判断是否已耗尽重试）
+            self._retry_count[step.id] = retries + 1
             if retries < self.max_retries_per_step:
                 step.status = "failed"  # 允许重试
-                self._retry_count[step.id] = retries + 1
                 logger.warning(
                     f"步骤 {step.id} 失败 ({retries + 1}/{self.max_retries_per_step} 次重试)"
                 )
@@ -193,6 +194,9 @@ class PlanExecutor:
             2. 该步骤有后续步骤依赖它
             3. 尚未超过最大重规划次数
 
+        当 skip_failed_non_critical=True 时，不会触发重规划，
+        而是直接标记依赖步骤为 skipped（由 get_next_step 处理）。
+
         Args:
             plan: 当前计划
 
@@ -207,8 +211,8 @@ class PlanExecutor:
             if step.status != "failed":
                 continue
             retries = self._retry_count.get(step.id, 0)
-            if retries < self.max_retries_per_step:
-                continue  # 还有重试机会
+            if retries <= self.max_retries_per_step:
+                continue  # 还有重试机会（retries 未超过上限）
 
             # 检查是否有后续步骤依赖它
             dependents = [
@@ -216,6 +220,17 @@ class PlanExecutor:
                 if step.id in s.depends_on and s.status == "pending"
             ]
             if dependents:
+                if self.skip_failed_non_critical:
+                    # 直接跳过依赖步骤，不触发重规划
+                    for dep in dependents:
+                        dep.status = "skipped"
+                    logger.info(
+                        f"跳过 {len(dependents)} 个依赖步骤 "
+                        f"（{step.id} 失败且 skip_failed_non_critical=True）: "
+                        f"{[d.id for d in dependents]}"
+                    )
+                    continue  # 检查下一个失败步骤
+
                 logger.info(
                     f"触发重规划: {step.id} 失败，"
                     f"影响 {len(dependents)} 个后续步骤"
@@ -314,10 +329,15 @@ class PlanExecutor:
         if completed == total:
             plan.status = "completed"
             logger.info(f"计划执行完成: {completed}/{total} 步全部成功")
-        elif failed > 0 and not self.should_revise(plan):
+        elif completed == 0 and failed > 0 and not self.should_revise(plan):
+            # 没有任何步骤成功 + 无法重规划 → 彻底失败
             plan.status = "failed"
+            logger.warning(f"计划执行失败: 0/{total} 完成，{failed} 失败")
+        elif completed > 0 and failed > 0 and not self.should_revise(plan):
+            # 部分步骤成功，部分失败，无法重规划 → 部分完成（视为成功）
+            plan.status = "completed"
             logger.warning(
-                f"计划执行失败: {completed}/{total} 完成，{failed} 失败"
+                f"计划部分完成: {completed}/{total} 成功，{failed} 失败"
             )
         else:
             plan.status = "completed"  # 部分步骤被跳过但仍可达终点

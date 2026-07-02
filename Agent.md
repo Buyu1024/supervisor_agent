@@ -68,7 +68,7 @@ messages ──→ [调用 qwen3.7-plus] ──→ finish_reason?
 
 ---
 
-### 2.2 LLM 模块 —— 🔲 待开发
+### 2.2 LLM 模块 —— ✅ 已完成
 
 | 维度 | 说明 |
 |------|------|
@@ -341,7 +341,7 @@ class PlanningModule:
     def get_results_summary(plan) -> str: ...
 ```
 
-**Orchestrator 驱动模式**（未来 AgentOrchestrator 的使用方式）：
+**Orchestrator 驱动模式**（AgentOrchestrator 的使用方式）：
 
 ```python
 planning = PlanningModule()
@@ -363,7 +363,7 @@ summary = planning.finalize_plan(plan)
 
 ---
 
-### 2.5 工具模块 (Tools) —— 🔲 待开发
+### 2.5 工具模块 (Tools) —— ✅ 已完成
 
 | 维度 | 说明 |
 |------|------|
@@ -463,6 +463,80 @@ class ToolsModule:
 
 ---
 
+### 2.6 编排器模块 (Orchestrator) —— ✅ 已完成
+
+| 维度 | 说明 |
+|------|------|
+| **职责** | 五大模块的中央协调者，驱动感知 → 记忆 → 规划 → 执行 → 收尾完整流程 |
+| **输入** | 原始用户输入（文本 / 文件路径） |
+| **输出** | `OrchestratorResult`（最终回复 + 执行计划 + Token 用量 + 工具调用次数） |
+
+**核心架构**：
+
+```
+AgentOrchestrator
+├── OrchestratorConfig   # 一站式配置，分发给各子模块
+├── PerceptionModule     # 输入感知（文本/文件 → Message）
+├── MemoryModule         # 三层记忆（检索上下文 + 保存对话）
+├── PlanningModule       # 任务规划（纯状态机）
+├── LLMModule            # LLM 调用（含工具调用闭环）
+├── ToolsModule          # 工具注册与执行
+└── OrchestratorResult   # 统一返回（content + plan + tokens + tool_calls）
+```
+
+**主执行流程**：
+
+```
+原始输入
+  │
+  ▼
+Phase 1: 感知 → Message（敏感词拦截则直接返回拒绝）
+  │
+  ▼
+Phase 2: 记忆检索 → Context 字符串
+  │
+  ▼
+Phase 3: 生成计划 → PlanningModule.build_plan_prompt() → LLM → parse_plan()
+  │         （JSON 解析失败自动重试，验证失败直接上抛）
+  ▼
+Phase 4: 执行循环
+  │       while (step := planning.get_next_step(plan)):
+  │           prompt = planning.build_step_prompt(plan, step)
+  │           result = llm.chat(prompt, tools=(step.action=="tool_call"))
+  │           plan = planning.record_result(plan, result)
+  │           if planning.should_revise(plan):
+  │               plan = _revise_plan(plan)  → LLM 生成新步骤 → parse_steps()
+  │
+  ▼
+Phase 5: 收尾 → finalize_plan() → memory.remember() → OrchestratorResult
+```
+
+**对外接口**：
+
+```python
+class AgentOrchestrator:
+    def __init__(self, config: OrchestratorConfig | None = None): ...
+    def run(self, raw_input) -> OrchestratorResult: ...
+    def clear_session(self) -> None: ...
+
+    # 模块访问（只读 property）
+    perception: PerceptionModule
+    memory: MemoryModule
+    planning: PlanningModule
+    llm: LLMModule
+    tools: ToolsModule
+```
+
+**关键设计决策**：
+
+1. **相对导入**：编排器内部使用相对导入（`from ..llm import LLMModule`），保证与测试代码使用同一模块对象，避免 mock 失效
+2. **步骤间历史隔离**：每步执行前调用 `llm.clear_history()`，确保步骤间不泄漏上下文（步骤上下文由 PlanPromptBuilder 自包含地提供）
+3. **计划生成无工具**：`_generate_plan()` 时将 `tools=None`，避免 LLM 在规划阶段调用工具
+4. **失败不阻塞**：独立步骤（无依赖关系）互不影响——一个失败不影响另一个的执行
+5. **重规划自动跳过**：当 `skip_failed_non_critical=True` 时，`should_revise` 自动将依赖失败步骤的步骤标记为 skipped，不触发重规划
+
+---
+
 ## 3. 模块间通信协议
 
 所有模块通过 **Agent 编排器 (AgentOrchestrator)** 协调，模块之间不直接耦合：
@@ -507,12 +581,12 @@ Orchestrator
 ## 4. 实现路线图
 
 ```
-Phase 1: 感知模块 ✅ 已完成（8827e7a）
-Phase 2: LLM 模块   ✅ 已完成（9710cee）
-Phase 3: 工具模块   ✅ 已完成（8cd805a）
-Phase 4: 记忆模块   ✅ 已完成（d5bea22）
-Phase 5: 规划模块   ✅ 已完成（待提交）
-Phase 6: 编排器 + 端到端集成测试 ← 下一步
+Phase 1: 感知模块       ✅ 已完成（8827e7a）
+Phase 2: LLM 模块       ✅ 已完成（9710cee）
+Phase 3: 工具模块       ✅ 已完成（8cd805a）
+Phase 4: 记忆模块       ✅ 已完成（d5bea22）
+Phase 5: 规划模块       ✅ 已完成（f3f2036）
+Phase 6: 编排器 + 集成  ✅ 已完成（待提交）
 ```
 
 **建议顺序的理由**：LLM 和工具是 Agent 的核心循环（思考 ↔ 行动），应先打通；记忆为 LLM 提供上下文增强；规划在最上层编排复杂流程。
@@ -545,3 +619,8 @@ Phase 6: 编排器 + 端到端集成测试 ← 下一步
 | 10 | 工具安全确认策略 | Tools | ✅ | **回调注入**（require_confirm + confirm_callback） |
 | 11 | 首批内置工具 | Tools | ✅ | **仅框架**，工具由用户自由注册 |
 | 12 | LLM API Key 配置方式 | LLM | ✅ | **环境变量 + 显式传入**（两种方式） |
+| 13 | 编排器模块导入方式 | Orchestrator | ✅ | **相对导入**（保证 mock 测试兼容） |
+| 14 | 计划生成重试策略 | Orchestrator | ✅ | **JSON 解析错误重试 / 验证错误上抛**（不重试逻辑错误） |
+| 15 | 步骤间上下文隔离 | Orchestrator | ✅ | **clear_history 隔离**（每步自包含 prompt） |
+| 16 | 非依赖失败处理 | Planning | ✅ | **部分成功视为整体成功**（独立步骤互不影响） |
+| 17 | 重规划触发时机 | Planning | ✅ | **skip_failed_non_critical=True 时自动跳过**（不触发重规划） |
